@@ -14,7 +14,7 @@ import logging
 import pyspark.sql.functions as f
 
 from pyspark.sql import SparkSession, Row
-from pyspark.sql.functions import col, rank
+from pyspark.sql.functions import col, rank, desc
 from pyspark.sql.window import Window
 from taar_utils import store_json_to_s3
 from taar_utils import load_amo_curated_whitelist
@@ -61,7 +61,7 @@ def get_addons(spark):
             AND col.type = 'extension' -- nice webextensions only
             AND col.signed_state = 2 -- fully reviewed addons only
             AND col.user_disabled = FALSE -- active addons only get counted
-            AND col.app_disabled = FALSE -- exclude compatibility disabled addons
+            AND col.app_disabled = FALSE -- exclude compatibility disabled
             AND col.is_system = FALSE -- exclude system addons
             AND locality <> 'null'
             AND col.addon_id is not null
@@ -97,20 +97,20 @@ def compute_threshold(addon_df):
     # small number of addons installations.
     locale_pop_threshold =\
         addon_install_counts.approxQuantile('sum(pair_cnts)', [0.25], 0.2)[0]
-    
+
     # Safety net in case the distribution gets really skewed, we should
     # require 2000 addon installation instances to make recommendations.
     if locale_pop_threshold < 2000:
         locale_pop_threshold = 2000
-    
+
     # Filter the list to only include locales including a sufficient
     # number of addon installations. Include number of addons in locales
     # that satisfy the threshold condition.
     addon_locale_counts = (
         addon_install_counts
-        .filter((f.col('sum(pair_cnts)')>=locale_pop_threshold))
+        .filter((f.col('sum(pair_cnts)') >= locale_pop_threshold))
         )
-    
+
     return addon_locale_counts
 
 
@@ -122,15 +122,15 @@ def transform(addon_df, addon_locale_counts_df, num_addons):
     :param num_addons: requested number of recommendations.
     :return: a dictionary {<locale>: ['GUID1', 'GUID2', ...]}
     """
-    
+
     # Helper function to normalize addon installations in a lambda.
     def normalize_cnts(p):
         loc_norm = float(p['pair_cnts'])/float(p['sum(pair_cnts)'])
         return loc_norm
-    
+
     # Instantiate an empty dict.
     top10_per = {}
-    
+
     # Join addon pair counts with total addon installs per locale.
     # need to clone the DFs to workaround for SPARK bug#14948
     # https://issues.apache.org/jira/browse/SPARK-14948
@@ -142,40 +142,48 @@ def transform(addon_df, addon_locale_counts_df, num_addons):
         .join(df1, df2.locality == df1.locality)
         .drop(df1.locality)
     )
-    
+
     # Normalize installation rate per locale.
     normalized_installs = combined_df.rdd.map(
-        lambda p: Row(addon_key=p['addon_key'], 
-        locality=p['locality'], 
-        loc_norm = normalize_cnts(p))
-    ).toDF()
+        lambda p: Row(
+            addon_key=p['addon_key'],
+            locality=p['locality'],
+            loc_normclear=normalize_cnts(p))
+        ).toDF()
 
     # Groupby locale and sort by normalized install rate
     window = Window\
         .partitionBy(normalized_installs['locality'])\
-        .orderBy(d['loc_norm']\
-        .desc())
-    
-    # Truncate reults exceeding required number of addons.
-    truncated_df = \
-        normalized_installs\
-        .select('*', rank()\
-        .over(window)\
-        .alias('rank'))\
-        .filter(col('rank') <= num_addons)\
-        .drop(col('rank'))
+        .orderBy(desc('loc_norm'))
 
-    list_of_locales =\
-        [x[0] for x in truncated_df.select(truncated_df.locality).distinct().collect()]
-        
-    # There is probably a *much* smarter way fo doing this, but I am le tired.
-    for specific_locale in list_of_locales:
-        # Most popular addons per locale sorted by normalized number of installs.
-        top10_per[specific_locale] = (
-            [[x['addon_key'], x['loc_norm']] for x in truncated_df
-            .filter(truncated_df.locality == specific_locale)
-            .collect()]
+    # Truncate reults exceeding required number of addons.
+    truncated_df = (
+        normalized_installs
+        .select(
+            '*', rank()
+            .over(window)
+            .alias('rank')
+            )
+        .filter(col('rank') <= num_addons)
+        .drop(col('rank'))
         )
+
+    list_of_locales = [
+        x[0] for x in truncated_df
+        .select(truncated_df.locality)
+        .distinct()
+        .collect()
+        ]
+
+    # There is probably a *much* smarter way fo doing this...
+    # but alas, I am le tired.
+    for specific_locale in list_of_locales:
+        # Most popular addons per locale sorted by normalized
+        # number of installs.
+        top10_per[specific_locale] =\
+            [[x['addon_key'], x['loc_norm']] for x in truncated_df
+                .filter(truncated_df.locality == specific_locale)
+                .collect()]
     return top10_per
 
 
@@ -183,7 +191,7 @@ def generate_dictionary(spark, num_addons):
     """ Wrap the dictionary generation functions in an
     easily testable way.
     """
-    # Execute spark.SQL query to get fresh addons from longitudinal telemetry data.
+    # Execute spark.SQL query to get fresh addons from clients_daily.
     addon_df = get_addons(spark)
 
     # Load external whitelist based on AMO data.
@@ -194,7 +202,7 @@ def generate_dictionary(spark, num_addons):
 
     # Make sure not to include addons from very small locales.
     addon_locale_counts_df = compute_threshold(addon_df_filtered)
-    return transform(addon_df_filtered, locale_pop_threshold, num_addons)
+    return transform(addon_df_filtered, addon_locale_counts_df, num_addons)
 
 
 @click.command()
